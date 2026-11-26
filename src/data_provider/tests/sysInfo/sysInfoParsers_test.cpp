@@ -211,6 +211,211 @@ TEST_F(SysInfoParsersTest, UnixRhcosRhelVersionQuoted)
     EXPECT_FALSE(output.contains("os_patch"));
 }
 
+// ----------------------------------------------------------------------------
+// Derivative distributions (https://github.com/wazuh/wazuh/issues/40484): ID
+// names the derivative's own project and ID_LIKE the parent family the scanner
+// scans under; a derivative of Debian testing or unstable carries the base
+// release nowhere else than in the suite code name of VERSION_CODENAME.
+// ----------------------------------------------------------------------------
+
+TEST_F(SysInfoParsersTest, UnixDebianDerivativeFromIdLike)
+{
+    // TUXEDO OS (Debian testing "forky"), os-release as reported in issue
+    // #40484: no VERSION, no VERSION_ID, so the release is only recoverable
+    // from VERSION_CODENAME. A delimited raw string is required: the value in
+    // PRETTY_NAME ends with ")", which would close an undelimited one.
+    constexpr auto UNIX_RELEASE_FILE
+    {
+        R"os(
+        NAME="TUXEDO OS"
+        ID=tuxedo
+        ID_LIKE="debian"
+        PRETTY_NAME="TUXEDO OS (Debian base)"
+        VERSION_CODENAME=forky
+        )os"
+    };
+    nlohmann::json output;
+    std::stringstream info{UNIX_RELEASE_FILE};
+    const auto spParser{FactorySysOsParser::create("unix")};
+    EXPECT_TRUE(spParser->parseFile(info, output));
+    EXPECT_EQ("TUXEDO OS", output["os_name"]);
+    EXPECT_EQ("debian", output["os_platform"]);
+    EXPECT_EQ("14", output["os_version"]);
+    EXPECT_EQ("14", output["os_major"]);
+    EXPECT_EQ("forky", output["os_codename"]);
+    EXPECT_FALSE(output.contains("os_minor"));
+    EXPECT_FALSE(output.contains("os_patch"));
+    EXPECT_FALSE(output.contains("id_like"));
+}
+
+TEST_F(SysInfoParsersTest, UbuntuFamilyDerivativeFromIdLike)
+{
+    // Pop!_OS: not a scannable platform on its own; the first scannable parent
+    // in ID_LIKE (tokens in order of decreasing similarity, per os-release(5))
+    // is adopted.
+    constexpr auto UNIX_RELEASE_FILE
+    {
+        R"(
+        NAME="Pop!_OS"
+        ID=pop
+        ID_LIKE="ubuntu debian"
+        PRETTY_NAME="Pop!_OS 22.04"
+        VERSION_ID="22.04"
+        VERSION_CODENAME=jammy
+        )"
+    };
+    nlohmann::json output;
+    std::stringstream info{UNIX_RELEASE_FILE};
+    const auto spParser{FactorySysOsParser::create("unix")};
+    EXPECT_TRUE(spParser->parseFile(info, output));
+    EXPECT_EQ("Pop!_OS", output["os_name"]);
+    EXPECT_EQ("ubuntu", output["os_platform"]);
+    EXPECT_EQ("22.04", output["os_version"]);
+    EXPECT_EQ("22", output["os_major"]);
+    EXPECT_EQ("jammy", output["os_codename"]);
+}
+
+TEST_F(SysInfoParsersTest, UnixDerivativeIdLikeWithoutScannableParent)
+{
+    // None of the listed parents is a platform the pipeline scans: the ID
+    // stands and no release is invented either.
+    constexpr auto UNIX_RELEASE_FILE
+    {
+        R"(
+        NAME="TUXEDO OS"
+        ID=tuxedo
+        ID_LIKE="someproject otherproject"
+        VERSION_CODENAME=forky
+        )"
+    };
+    nlohmann::json output;
+    std::stringstream info{UNIX_RELEASE_FILE};
+    const auto spParser{FactorySysOsParser::create("unix")};
+    EXPECT_TRUE(spParser->parseFile(info, output));
+    EXPECT_EQ("TUXEDO OS", output["os_name"]);
+    EXPECT_EQ("tuxedo", output["os_platform"]);
+    EXPECT_EQ("forky", output["os_codename"]);
+    EXPECT_FALSE(output.contains("os_version"));
+    EXPECT_FALSE(output.contains("os_major"));
+}
+
+TEST_F(SysInfoParsersTest, UnixDerivativeKnownPlatformNotReplaced)
+{
+    // The ID is already a scannable platform: ID_LIKE must not override it.
+    constexpr auto UNIX_RELEASE_FILE
+    {
+        R"(
+        NAME="Ubuntu"
+        ID=ubuntu
+        ID_LIKE=debian
+        VERSION_ID="20.04"
+        )"
+    };
+    nlohmann::json output;
+    std::stringstream info{UNIX_RELEASE_FILE};
+    const auto spParser{FactorySysOsParser::create("unix")};
+    EXPECT_TRUE(spParser->parseFile(info, output));
+    EXPECT_EQ("Ubuntu", output["os_name"]);
+    EXPECT_EQ("ubuntu", output["os_platform"]);
+    EXPECT_EQ("20.04", output["os_version"]);
+    EXPECT_EQ("20", output["os_major"]);
+    EXPECT_EQ("04", output["os_minor"]);
+}
+
+TEST_F(SysInfoParsersTest, UnixDebianDerivativeCodenameNotDebianSuite)
+{
+    // VERSION_CODENAME naming the derivative rather than a Debian base suite:
+    // the platform still falls back to the family, but no release is made up
+    // for it.
+    constexpr auto UNIX_RELEASE_FILE
+    {
+        R"(
+        NAME="Some Debian derivative"
+        ID=somederivative
+        ID_LIKE="debian"
+        VERSION_CODENAME=fancyname
+        )"
+    };
+    nlohmann::json output;
+    std::stringstream info{UNIX_RELEASE_FILE};
+    const auto spParser{FactorySysOsParser::create("unix")};
+    EXPECT_TRUE(spParser->parseFile(info, output));
+    EXPECT_EQ("Some Debian derivative", output["os_name"]);
+    EXPECT_EQ("debian", output["os_platform"]);
+    EXPECT_EQ("fancyname", output["os_codename"]);
+    EXPECT_FALSE(output.contains("os_version"));
+    EXPECT_FALSE(output.contains("os_major"));
+}
+
+TEST_F(SysInfoParsersTest, UnixDebianDerivativeParsedTwice)
+{
+    // The agent parses /etc/os-release and /usr/lib/os-release into the same
+    // object; the second pass must find the platform already recovered and not
+    // disturb the identity, nor leak the ID_LIKE temporary field.
+    constexpr auto UNIX_RELEASE_FILE
+    {
+        R"os(
+        NAME="TUXEDO OS"
+        ID=tuxedo
+        ID_LIKE="debian"
+        PRETTY_NAME="TUXEDO OS (Debian base)"
+        VERSION_CODENAME=forky
+        )os"
+    };
+    nlohmann::json output;
+    const auto spParser{FactorySysOsParser::create("unix")};
+    std::stringstream etcInfo{UNIX_RELEASE_FILE};
+    EXPECT_TRUE(spParser->parseFile(etcInfo, output));
+    std::stringstream usrLibInfo{UNIX_RELEASE_FILE};
+    EXPECT_TRUE(spParser->parseFile(usrLibInfo, output));
+    EXPECT_EQ("TUXEDO OS", output["os_name"]);
+    EXPECT_EQ("debian", output["os_platform"]);
+    EXPECT_EQ("14", output["os_version"]);
+    EXPECT_EQ("14", output["os_major"]);
+    EXPECT_FALSE(output.contains("id_like"));
+}
+
+TEST_F(SysInfoParsersTest, UnixDebianDerivativeUnderContainerImage)
+{
+    // Containerized agent, issue #40484 layout in reverse: the host TUXEDO
+    // os-release is parsed first and the container image (Ubuntu) second, into
+    // the same object. parseUnixFile is first-wins, and the derivative
+    // fallback must respect that: the host identity survives untouched, the
+    // image's family in ID_LIKE must not re-derive the platform over it.
+    constexpr auto HOST_RELEASE_FILE
+    {
+        R"os(
+        NAME="TUXEDO OS"
+        ID=tuxedo
+        ID_LIKE="debian"
+        PRETTY_NAME="TUXEDO OS (Debian base)"
+        VERSION_CODENAME=forky
+        )os"
+    };
+    constexpr auto IMAGE_RELEASE_FILE
+    {
+        R"(
+        NAME="Ubuntu"
+        ID=ubuntu
+        ID_LIKE=debian
+        VERSION_ID="24.04"
+        VERSION_CODENAME=noble
+        )"
+    };
+    nlohmann::json output;
+    const auto spParser{FactorySysOsParser::create("unix")};
+    std::stringstream hostInfo{HOST_RELEASE_FILE};
+    EXPECT_TRUE(spParser->parseFile(hostInfo, output));
+    std::stringstream imageInfo{IMAGE_RELEASE_FILE};
+    EXPECT_TRUE(spParser->parseFile(imageInfo, output));
+    EXPECT_EQ("TUXEDO OS", output["os_name"]);
+    EXPECT_EQ("debian", output["os_platform"]);
+    EXPECT_EQ("14", output["os_version"]);
+    EXPECT_EQ("14", output["os_major"]);
+    EXPECT_EQ("forky", output["os_codename"]);
+    EXPECT_FALSE(output.contains("id_like"));
+}
+
 TEST_F(SysInfoParsersTest, UnixRhcosParsedTwice)
 {
     // The agent parses /etc/os-release and /usr/lib/os-release into the same object.

@@ -11,6 +11,8 @@
 #include "osinfo/sysOsParsers.h"
 #include "json.hpp"
 #include "stringHelper.h"
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <istream>
 #include <iterator>
@@ -123,6 +125,131 @@ static bool findVersionInStream(std::istream& in,
     return ret;
 }
 
+/// Parent distributions a derivative may declare through ID_LIKE, that the
+/// scanner can scan by platform.
+///
+/// Deliberately narrow. Debian and Ubuntu are the families whose feeds are
+/// keyed independently of the package inventory, and the identity of a
+/// derivative of either of them is fully recovered from ID_LIKE. Other listed
+/// parents are not attempted on purpose: several distributions declare parents
+/// in ID_LIKE that already have their own platform handling downstream
+/// (e.g. Amazon's "ID_LIKE=centos rhel fedora"), where a blindly rewritten
+/// platform would change the scan.
+static constexpr std::array<const char*, 2> ID_LIKE_PLATFORM_FALLBACKS {"debian", "ubuntu"};
+
+/// Debian release number by suite code name.
+///
+/// os-release on Debian testing and unstable — and on derivatives of it — does
+/// not set VERSION_ID, so the release can only be recovered from
+/// VERSION_CODENAME (TUXEDO OS on "forky" reports no version at all,
+/// https://github.com/wazuh/wazuh/issues/40484). Mirrors the release/code name
+/// pairs the scanner content carries manager-side
+/// ("debianReleaseCodeNames"); grows with new Debian releases.
+static const std::map<std::string, std::string> DEBIAN_CODE_NAME_RELEASE_MAP
+{
+    {"stretch", "9"},
+    {"buster", "10"},
+    {"bullseye", "11"},
+    {"bookworm", "12"},
+    {"trixie", "13"},
+    {"forky", "14"},
+    {"duke", "15"},
+};
+
+/// @brief Rewrites the platform of a derivative distribution to its parent.
+///
+/// Distributions like TUXEDO OS report their own project in ID and the family
+/// they belong to in ID_LIKE ("ID=tuxedo, ID_LIKE=debian"). When ID is not
+/// already one of the scannable parents, the first known parent listed in
+/// ID_LIKE — tokens are in order of decreasing similarity, per os-release(5) —
+/// replaces it. Nothing else about the identity is rewritten: os_name keeps
+/// describing the derivative itself, so the inventoried system stays "TUXEDO
+/// OS" and only the scanning identity falls back to scannable terms.
+///
+/// @param output OS information parsed so far.
+static void normalizePlatformFromIdLike(nlohmann::json& output)
+{
+    // The value from ID is authoritative whenever it is already one of the
+    // platforms the rest of the pipeline understands; also the exit for the
+    // second os-release pass, where ID_LIKE has already been consumed below.
+    std::string currentPlatform;
+
+    if (output.contains("os_platform") && output["os_platform"].is_string())
+    {
+        currentPlatform = Utils::toLowerCase(output["os_platform"].get<std::string>());
+    }
+
+    if (std::find_if(std::begin(ID_LIKE_PLATFORM_FALLBACKS),
+                     std::end(ID_LIKE_PLATFORM_FALLBACKS),
+                     [&currentPlatform](const char* parent)
+                     {
+                         return currentPlatform == parent;
+                     }) != std::end(ID_LIKE_PLATFORM_FALLBACKS))
+    {
+        return;
+    }
+
+    if (!output.contains("id_like") || !output["id_like"].is_string())
+    {
+        return;
+    }
+
+    for (const auto& token : Utils::split(output["id_like"].get<std::string>(), ' '))
+    {
+        if (token.empty())
+        {
+            continue;
+        }
+
+        const auto tokenLower{Utils::toLowerCase(token)};
+
+        if (std::find_if(std::begin(ID_LIKE_PLATFORM_FALLBACKS),
+                         std::end(ID_LIKE_PLATFORM_FALLBACKS),
+                         [&tokenLower](const char* parent)
+                         {
+                             return tokenLower == parent;
+                         }) != std::end(ID_LIKE_PLATFORM_FALLBACKS))
+        {
+            output["os_platform"] = tokenLower;
+            return;
+        }
+    }
+}
+
+/// @brief Derives the Debian release number from the suite code name.
+///
+/// With the platform resolved as Debian and no version to speak of — Debian
+/// testing and unstable do not carry VERSION_ID, and neither do derivatives
+/// built on them — the only remaining release hint is the suite code name in
+/// VERSION_CODENAME ("forky" -> 14). The recovered release fills both the
+/// raw version and the major version, the fields the scanner keys the Debian
+/// family scans on; a code name that is not a Debian suite name leaves
+/// everything untouched.
+///
+/// @param output OS information parsed so far.
+static void deriveDebianReleaseFromCodeName(nlohmann::json& output)
+{
+    const bool debianPlatform {output.contains("os_platform") && output["os_platform"].is_string() &&
+                               output["os_platform"].get<std::string>() == "debian"};
+
+    // A version already recovered from VERSION_ID or VERSION means the release
+    // is known and the code name is not its authority; VERSION_CODENAME on a
+    // derivative may also name the derivative's own identity, not the base
+    // suite, and finding no release for it is the honest outcome then.
+    if (!debianPlatform || output.contains("os_major") || !output.contains("os_codename") ||
+        !output["os_codename"].is_string())
+    {
+        return;
+    }
+
+    if (const auto itSuite {DEBIAN_CODE_NAME_RELEASE_MAP.find(output["os_codename"].get<std::string>())};
+        itSuite != DEBIAN_CODE_NAME_RELEASE_MAP.end())
+    {
+        output["os_version"] = itSuite->second;
+        findMajorMinorVersionInString(output["os_version"], output);
+    }
+}
+
 bool UnixOsParser::parseFile(std::istream& in, nlohmann::json& output)
 {
     constexpr auto SEPARATOR{'='};
@@ -132,25 +259,40 @@ bool UnixOsParser::parseFile(std::istream& in, nlohmann::json& output)
         {"VERSION",          "os_version"},
         {"VERSION_ID",       "version_id"},
         {"ID",               "os_platform"},
+        {"ID_LIKE",          "id_like"},
         {"BUILD_ID",         "os_build"},
         {"VERSION_CODENAME", "os_codename"},
         {"RHEL_VERSION",     "rhel_version"}
     };
+    // parseUnixFile never overwrites an already populated field: on the second
+    // os-release pass of a containerized agent the host identity stays intact
+    // by construction. The derivative fallbacks below write those very fields,
+    // therefore they may only run when the identity is not already established
+    // on entry, or the container image would re-derive it over the host's
+    // (e.g. an Ubuntu image under RHCOS). Snapshot BEFORE the parse: the parse
+    // itself populates os_platform.
+    const bool identityEstablishedOnEntry {output.contains("os_platform")};
     const auto ret {parseUnixFile(KEY_MAPPING, SEPARATOR, in, output)};
 
     if (ret)
     {
+        // The version derivations below compare this file's fields against
+        // already populated values; under the same host-first rule as the
+        // identity fallbacks they may only fill in an identity that is not yet
+        // established, never revise one from a later file.
         if (output.find("os_version") != output.end())
         {
             findMajorMinorVersionInString(output["os_version"], output);
 
             // If VERSION doesn't have major.minor, try VERSION_ID as fallback
-            if ((!output.contains("os_major") || !output.contains("os_minor")) && output.find("version_id") != output.end())
+            if (!identityEstablishedOnEntry &&
+                (!output.contains("os_major") || !output.contains("os_minor")) &&
+                output.find("version_id") != output.end())
             {
                 findMajorMinorVersionInString(output["version_id"], output);
             }
         }
-        else if (output.find("version_id") != output.end())
+        else if (!identityEstablishedOnEntry && output.find("version_id") != output.end())
         {
             // If VERSION is not found, use VERSION_ID as os_version
             output["os_version"] = output["version_id"];
@@ -173,9 +315,23 @@ bool UnixOsParser::parseFile(std::istream& in, nlohmann::json& output)
             }
         }
 
+        // A derivative distribution names itself in ID and its base family in
+        // ID_LIKE (TUXEDO OS: ID=tuxedo, ID_LIKE=debian), and a derivative of
+        // Debian testing or unstable carries the base release nowhere else
+        // than in the suite code name. Recover the scanning platform and the
+        // release the version fields failed to report, on the parse that
+        // establishes the identity. The platform walk is first: the release
+        // derivation matches on the resolved family.
+        if (!identityEstablishedOnEntry)
+        {
+            normalizePlatformFromIdLike(output);
+            deriveDebianReleaseFromCodeName(output);
+        }
+
         // Clean up temporary fields
         output.erase("version_id");
         output.erase("rhel_version");
+        output.erase("id_like");
     }
 
     return ret;
